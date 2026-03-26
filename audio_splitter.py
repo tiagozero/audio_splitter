@@ -3,6 +3,12 @@
 Audio Splitter — uses ffmpeg directly (no pydub).
 Works with MP3, M4A, M4B, WAV, OGG, FLAC and more.
 Reads only metadata on open — never loads the full file into RAM.
+
+New features:
+  • Split by chapters
+  • Quality selection: 96 / 128 / 320 kbps
+  • Split into equal-duration parts (e.g. 1 hour each)
+  • Split into N equal parts
 """
 
 import os
@@ -11,6 +17,7 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
+import json
 
 
 # ── ffmpeg helpers ────────────────────────────────────────────────────────────
@@ -47,27 +54,66 @@ def get_audio_info(path: str) -> dict:
             "channels": channels}
 
 
-def export_segment(src: str, out: str, start_ms: int, end_ms: int, fmt: str):
-    """Cut with ffmpeg. Uses stream copy when possible (instant), else re-encodes."""
+def get_chapters(path: str) -> list:
+    """Return list of chapter dicts: {title, start_ms, end_ms}."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error",
+         "-print_format", "json",
+         "-show_chapters",
+         path],
+        capture_output=True, text=True
+    )
+    try:
+        data = json.loads(result.stdout)
+        chapters = []
+        for ch in data.get("chapters", []):
+            start_ms = int(float(ch.get("start_time", 0)) * 1000)
+            end_ms   = int(float(ch.get("end_time",   0)) * 1000)
+            title    = ch.get("tags", {}).get("title", f"Chapter {ch.get('id', '?') + 1}")
+            chapters.append({"title": title, "start_ms": start_ms, "end_ms": end_ms})
+        return chapters
+    except Exception:
+        return []
+
+
+def export_segment(src: str, out: str, start_ms: int, end_ms: int,
+                   fmt: str, quality_kbps: int = None):
+    """
+    Cut with ffmpeg.
+    quality_kbps: None = use smart default / stream-copy;
+                  96 / 128 / 320 = force re-encode at that bitrate.
+    """
     start_s = start_ms / 1000.0
     dur_s   = (end_ms - start_ms) / 1000.0
     src_ext = Path(src).suffix.lower()
 
-    copy_ok = (src_ext in (".m4b", ".m4a") and fmt in ("m4a",)) or \
-              (src_ext == f".{fmt}")
+    # Stream-copy is only valid when no quality override is requested
+    copy_ok = quality_kbps is None and (
+        (src_ext in (".m4b", ".m4a") and fmt in ("m4a",)) or
+        (src_ext == f".{fmt}")
+    )
 
     if copy_ok:
         codec_args = ["-c", "copy"]
     elif fmt == "mp3":
-        codec_args = ["-c:a", "libmp3lame", "-q:a", "2"]
+        if quality_kbps:
+            codec_args = ["-c:a", "libmp3lame", "-b:a", f"{quality_kbps}k"]
+        else:
+            codec_args = ["-c:a", "libmp3lame", "-q:a", "2"]
     elif fmt == "m4a":
-        codec_args = ["-c:a", "aac", "-b:a", "192k"]
+        if quality_kbps:
+            codec_args = ["-c:a", "aac", "-b:a", f"{quality_kbps}k"]
+        else:
+            codec_args = ["-c:a", "aac", "-b:a", "192k"]
     elif fmt == "ogg":
-        codec_args = ["-c:a", "libvorbis", "-q:a", "6"]
+        if quality_kbps:
+            codec_args = ["-c:a", "libvorbis", "-b:a", f"{quality_kbps}k"]
+        else:
+            codec_args = ["-c:a", "libvorbis", "-q:a", "6"]
     elif fmt == "flac":
-        codec_args = ["-c:a", "flac"]
+        codec_args = ["-c:a", "flac"]          # lossless — bitrate ignored
     elif fmt == "wav":
-        codec_args = ["-c:a", "pcm_s16le"]
+        codec_args = ["-c:a", "pcm_s16le"]     # lossless — bitrate ignored
     else:
         codec_args = []
 
@@ -108,6 +154,14 @@ def ms_to_hms(ms: int) -> str:
     return f"{h:02d}:{m:02d}:{sec:02d}"
 
 
+def sanitize_filename(name: str) -> str:
+    """Remove / replace characters that are illegal in file names."""
+    bad = r'\/:*?"<>|'
+    for ch in bad:
+        name = name.replace(ch, "_")
+    return name.strip()
+
+
 # ── App ───────────────────────────────────────────────────────────────────────
 
 class AudioSplitterApp(tk.Tk):
@@ -123,6 +177,7 @@ class AudioSplitterApp(tk.Tk):
     PANEL  = "#18181f"
     ACCENT = "#c8a96e"
     ACC2   = "#7e6bcc"
+    ACC3   = "#6bcc9e"   # green for new feature buttons
     FG     = "#e8e4d9"
     FG2    = "#888"
     ENTRY  = "#22222c"
@@ -133,7 +188,7 @@ class AudioSplitterApp(tk.Tk):
         self.title("Audio Splitter")
         self.configure(bg=self.BG)
         self.resizable(True, True)
-        self.minsize(700, 530)
+        self.minsize(720, 660)
 
         if not check_ffmpeg():
             messagebox.showerror(
@@ -150,8 +205,15 @@ class AudioSplitterApp(tk.Tk):
         self.end_ms      = 0
         self.duration_ms = 0
         self.out_format  = tk.StringVar(value="mp3")
+        self.quality_var = tk.StringVar(value="128")   # NEW: bitrate selection
         self.status_msg  = tk.StringVar(value="Open an audio file to begin.")
         self.dragging    = None
+        self.chapters    = []                           # NEW: chapter list
+
+        # equal-parts & N-parts split vars
+        self.eq_hours    = tk.StringVar(value="1")
+        self.eq_mins     = tk.StringVar(value="0")
+        self.n_parts_var = tk.StringVar(value="5")
 
         self._build_fonts()
         self._build_ui()
@@ -164,21 +226,48 @@ class AudioSplitterApp(tk.Tk):
         self.font_time   = tkfont.Font(family="Courier New", size=13, weight="bold")
         self.font_btn    = tkfont.Font(family="Georgia",     size=11, weight="bold")
         self.font_status = tkfont.Font(family="Courier New", size=9)
+        self.font_small  = tkfont.Font(family="Courier New", size=9)
 
     # ── UI ────────────────────────────────────────────────────────────────────
     def _build_ui(self):
-        root = tk.Frame(self, bg=self.BG)
-        root.pack(fill="both", expand=True, padx=28, pady=24)
+        # Scrollable outer frame
+        outer = tk.Frame(self, bg=self.BG)
+        outer.pack(fill="both", expand=True)
 
+        canvas_scroll = tk.Canvas(outer, bg=self.BG, bd=0, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas_scroll.yview)
+        canvas_scroll.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas_scroll.pack(side="left", fill="both", expand=True)
+
+        root = tk.Frame(canvas_scroll, bg=self.BG)
+        win_id = canvas_scroll.create_window((0, 0), window=root, anchor="nw")
+
+        def _on_frame_configure(e):
+            canvas_scroll.configure(scrollregion=canvas_scroll.bbox("all"))
+        def _on_canvas_configure(e):
+            canvas_scroll.itemconfig(win_id, width=e.width)
+        root.bind("<Configure>", _on_frame_configure)
+        canvas_scroll.bind("<Configure>", _on_canvas_configure)
+
+        # mouse-wheel scrolling
+        def _on_mousewheel(e):
+            canvas_scroll.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        canvas_scroll.bind_all("<MouseWheel>", _on_mousewheel)
+
+        pad = dict(padx=28)
+
+        # ── Title ─────────────────────────────────────────────────────────────
         tk.Label(root, text="✦ Audio Splitter", font=self.font_title,
-                 bg=self.BG, fg=self.ACCENT).pack(anchor="w")
+                 bg=self.BG, fg=self.ACCENT, **pad).pack(anchor="w", pady=(24, 0))
         tk.Label(root, text="MP3 · M4A · M4B · WAV · OGG · FLAC  —  powered by ffmpeg",
-                 font=self.font_label, bg=self.BG, fg=self.FG2).pack(anchor="w")
+                 font=self.font_label, bg=self.BG, fg=self.FG2, **pad).pack(anchor="w")
 
         self._sep(root)
 
+        # ── File row ──────────────────────────────────────────────────────────
         frow = tk.Frame(root, bg=self.BG)
-        frow.pack(fill="x", pady=(0, 4))
+        frow.pack(fill="x", pady=(0, 4), **pad)
         tk.Label(frow, text="FILE", font=self.font_label,
                  bg=self.BG, fg=self.FG2, width=6, anchor="w").pack(side="left")
         tk.Entry(frow, textvariable=self.src_path, state="readonly",
@@ -191,29 +280,30 @@ class AudioSplitterApp(tk.Tk):
         self._btn(frow, "Browse…", self._open_file, small=True).pack(side="left")
 
         self.lbl_info = tk.Label(root, text="", font=self.font_label,
-                                 bg=self.BG, fg=self.FG2, anchor="w")
+                                 bg=self.BG, fg=self.FG2, anchor="w", **pad)
         self.lbl_info.pack(fill="x", pady=(2, 8))
 
         self._sep(root)
 
+        # ── Timeline ──────────────────────────────────────────────────────────
         tk.Label(root, text="SELECT RANGE  — drag handles or type times below",
-                 font=self.font_label, bg=self.BG, fg=self.FG2
+                 font=self.font_label, bg=self.BG, fg=self.FG2, **pad
                  ).pack(anchor="w", pady=(4, 4))
 
-        self.canvas = tk.Canvas(root, bg=self.PANEL, bd=0,
-                                highlightthickness=1,
-                                highlightbackground=self.BORDER,
-                                height=84, cursor="crosshair")
-        self.canvas.pack(fill="x", pady=(0, 8))
-        self.canvas.bind("<ButtonPress-1>",   self._canvas_press)
-        self.canvas.bind("<B1-Motion>",       self._canvas_drag)
-        self.canvas.bind("<ButtonRelease-1>",
-                         lambda e: setattr(self, "dragging", None))
-        self.canvas.bind("<Configure>",       self._draw_timeline)
+        self.timeline = tk.Canvas(root, bg=self.PANEL, bd=0,
+                                  highlightthickness=1,
+                                  highlightbackground=self.BORDER,
+                                  height=84, cursor="crosshair")
+        self.timeline.pack(fill="x", pady=(0, 8), **pad)
+        self.timeline.bind("<ButtonPress-1>",   self._canvas_press)
+        self.timeline.bind("<B1-Motion>",       self._canvas_drag)
+        self.timeline.bind("<ButtonRelease-1>",
+                           lambda e: setattr(self, "dragging", None))
+        self.timeline.bind("<Configure>",       self._draw_timeline)
         self._draw_timeline()
 
         trow = tk.Frame(root, bg=self.BG)
-        trow.pack(fill="x", pady=(0, 10))
+        trow.pack(fill="x", pady=(0, 10), **pad)
         for label, var, side in [("START  HH:MM:SS", self.start_str, "left"),
                                   ("END    HH:MM:SS", self.end_str,   "right")]:
             col = tk.Frame(trow, bg=self.BG)
@@ -234,38 +324,192 @@ class AudioSplitterApp(tk.Tk):
             e.bind("<Return>",   lambda *_: self._entries_to_handles())
 
         self.lbl_seg = tk.Label(root, text="", font=self.font_label,
-                                bg=self.BG, fg=self.ACC2)
-        self.lbl_seg.pack(pady=(0, 8))
+                                bg=self.BG, fg=self.ACC2, **pad)
+        self.lbl_seg.pack(pady=(0, 8), anchor="w")
 
         self._sep(root)
 
-        brow = tk.Frame(root, bg=self.BG)
-        brow.pack(fill="x", pady=(8, 0))
+        # ── Output format + Quality + Export single segment ────────────────
+        tk.Label(root, text="OUTPUT FORMAT  &  QUALITY",
+                 font=self.font_label, bg=self.BG, fg=self.FG2, **pad
+                 ).pack(anchor="w", pady=(4, 4))
 
-        tk.Label(brow, text="OUTPUT FORMAT", font=self.font_label,
-                 bg=self.BG, fg=self.FG2).pack(side="left", padx=(0, 10))
+        fmt_row = tk.Frame(root, bg=self.BG)
+        fmt_row.pack(fill="x", **pad)
+
+        # Format radios
+        fmt_col = tk.Frame(fmt_row, bg=self.BG)
+        fmt_col.pack(side="left")
+        tk.Label(fmt_col, text="Format:", font=self.font_small,
+                 bg=self.BG, fg=self.FG2).pack(anchor="w")
+        fmts_row = tk.Frame(fmt_col, bg=self.BG)
+        fmts_row.pack(anchor="w")
         for fmt in ("mp3", "m4a", "wav", "ogg", "flac"):
-            tk.Radiobutton(brow, text=fmt.upper(), variable=self.out_format,
+            tk.Radiobutton(fmts_row, text=fmt.upper(), variable=self.out_format,
                            value=fmt, bg=self.BG, fg=self.FG,
+                           selectcolor=self.PANEL, activebackground=self.BG,
+                           activeforeground=self.ACCENT,
+                           font=self.font_label, relief="flat",
+                           highlightthickness=0, bd=0,
+                           command=self._on_format_change
+                           ).pack(side="left", padx=3)
+
+        # Spacer
+        tk.Frame(fmt_row, bg=self.BG, width=24).pack(side="left")
+
+        # Quality radios (new)
+        self.qual_col = tk.Frame(fmt_row, bg=self.BG)
+        self.qual_col.pack(side="left")
+        tk.Label(self.qual_col, text="Quality (kbps):", font=self.font_small,
+                 bg=self.BG, fg=self.FG2).pack(anchor="w")
+        qual_row = tk.Frame(self.qual_col, bg=self.BG)
+        qual_row.pack(anchor="w")
+        for kbps in ("96", "128", "320"):
+            tk.Radiobutton(qual_row, text=kbps, variable=self.quality_var,
+                           value=kbps, bg=self.BG, fg=self.FG,
                            selectcolor=self.PANEL, activebackground=self.BG,
                            activeforeground=self.ACCENT,
                            font=self.font_label, relief="flat",
                            highlightthickness=0, bd=0
                            ).pack(side="left", padx=3)
+        self.lbl_lossless = tk.Label(qual_row, text="(lossless — bitrate N/A)",
+                                     font=self.font_small, bg=self.BG, fg=self.FG2)
 
-        self._btn(brow, "✦  Export Segment", self._export, accent=True
+        # Export segment button
+        self._btn(fmt_row, "✦  Export Segment", self._export, accent=True
                   ).pack(side="right")
 
+        self._on_format_change()   # set initial quality-widget visibility
+
+        self._sep(root)
+
+        # ══════════════════════════════════════════════════════════════════════
+        # NEW SECTION: Advanced splitting modes
+        # ══════════════════════════════════════════════════════════════════════
+        tk.Label(root, text="ADVANCED SPLITTING",
+                 font=self.font_label, bg=self.BG, fg=self.FG2, **pad
+                 ).pack(anchor="w", pady=(4, 6))
+
+        adv = tk.Frame(root, bg=self.PANEL,
+                       highlightthickness=1, highlightbackground=self.BORDER)
+        adv.pack(fill="x", **pad, pady=(0, 6))
+        adv.columnconfigure(0, weight=1)
+
+        # ── (A) Split by chapters ──────────────────────────────────────────
+        row_ch = tk.Frame(adv, bg=self.PANEL)
+        row_ch.pack(fill="x", padx=14, pady=10)
+
+        ch_left = tk.Frame(row_ch, bg=self.PANEL)
+        ch_left.pack(side="left", fill="x", expand=True)
+        tk.Label(ch_left, text="① Split by Chapters",
+                 font=self.font_btn, bg=self.PANEL, fg=self.ACCENT).pack(anchor="w")
+        self.lbl_chapters = tk.Label(ch_left,
+                                     text="(load a file with chapters to enable)",
+                                     font=self.font_small, bg=self.PANEL, fg=self.FG2)
+        self.lbl_chapters.pack(anchor="w")
+
+        self.btn_chapters = self._btn(row_ch, "Split All Chapters",
+                                      self._split_chapters, small=True)
+        self.btn_chapters.pack(side="right", padx=(8, 0))
+        self.btn_chapters.config(state="disabled")
+
+        self._hsep(adv)
+
+        # ── (B) Equal parts (by duration) ─────────────────────────────────
+        row_eq = tk.Frame(adv, bg=self.PANEL)
+        row_eq.pack(fill="x", padx=14, pady=10)
+
+        eq_left = tk.Frame(row_eq, bg=self.PANEL)
+        eq_left.pack(side="left", fill="x", expand=True)
+        tk.Label(eq_left, text="② Split into Equal Duration Parts",
+                 font=self.font_btn, bg=self.PANEL, fg=self.ACCENT).pack(anchor="w")
+
+        eq_ctrl = tk.Frame(eq_left, bg=self.PANEL)
+        eq_ctrl.pack(anchor="w", pady=(4, 0))
+        tk.Label(eq_ctrl, text="Part length:", font=self.font_small,
+                 bg=self.PANEL, fg=self.FG2).pack(side="left")
+        tk.Entry(eq_ctrl, textvariable=self.eq_hours, width=4,
+                 bg=self.ENTRY, fg=self.ACCENT, relief="flat",
+                 insertbackground=self.ACCENT, font=self.font_label,
+                 bd=0, highlightthickness=1,
+                 highlightcolor=self.ACCENT, highlightbackground=self.BORDER,
+                 justify="center").pack(side="left", ipady=4, padx=(6, 2))
+        tk.Label(eq_ctrl, text="h", font=self.font_small,
+                 bg=self.PANEL, fg=self.FG2).pack(side="left")
+        tk.Entry(eq_ctrl, textvariable=self.eq_mins, width=4,
+                 bg=self.ENTRY, fg=self.ACCENT, relief="flat",
+                 insertbackground=self.ACCENT, font=self.font_label,
+                 bd=0, highlightthickness=1,
+                 highlightcolor=self.ACCENT, highlightbackground=self.BORDER,
+                 justify="center").pack(side="left", ipady=4, padx=(6, 2))
+        tk.Label(eq_ctrl, text="min", font=self.font_small,
+                 bg=self.PANEL, fg=self.FG2).pack(side="left")
+
+        self.lbl_eq_preview = tk.Label(eq_left, text="",
+                                       font=self.font_small, bg=self.PANEL, fg=self.FG2)
+        self.lbl_eq_preview.pack(anchor="w", pady=(2, 0))
+
+        eq_btn_col = tk.Frame(row_eq, bg=self.PANEL)
+        eq_btn_col.pack(side="right", padx=(8, 0))
+        self._btn(eq_btn_col, "Preview", self._preview_equal_parts, small=True
+                  ).pack(pady=(0, 4))
+        self._btn(eq_btn_col, "Split Now", self._split_equal_parts, small=True
+                  ).pack()
+
+        self._hsep(adv)
+
+        # ── (C) Split into N files ─────────────────────────────────────────
+        row_n = tk.Frame(adv, bg=self.PANEL)
+        row_n.pack(fill="x", padx=14, pady=10)
+
+        n_left = tk.Frame(row_n, bg=self.PANEL)
+        n_left.pack(side="left", fill="x", expand=True)
+        tk.Label(n_left, text="③ Split into N Equal Files",
+                 font=self.font_btn, bg=self.PANEL, fg=self.ACCENT).pack(anchor="w")
+
+        n_ctrl = tk.Frame(n_left, bg=self.PANEL)
+        n_ctrl.pack(anchor="w", pady=(4, 0))
+        tk.Label(n_ctrl, text="Number of parts:", font=self.font_small,
+                 bg=self.PANEL, fg=self.FG2).pack(side="left")
+        tk.Entry(n_ctrl, textvariable=self.n_parts_var, width=5,
+                 bg=self.ENTRY, fg=self.ACCENT, relief="flat",
+                 insertbackground=self.ACCENT, font=self.font_label,
+                 bd=0, highlightthickness=1,
+                 highlightcolor=self.ACCENT, highlightbackground=self.BORDER,
+                 justify="center").pack(side="left", ipady=4, padx=(6, 0))
+
+        self.lbl_n_preview = tk.Label(n_left, text="",
+                                      font=self.font_small, bg=self.PANEL, fg=self.FG2)
+        self.lbl_n_preview.pack(anchor="w", pady=(2, 0))
+
+        n_btn_col = tk.Frame(row_n, bg=self.PANEL)
+        n_btn_col.pack(side="right", padx=(8, 0))
+        self._btn(n_btn_col, "Preview", self._preview_n_parts, small=True
+                  ).pack(pady=(0, 4))
+        self._btn(n_btn_col, "Split Now", self._split_n_parts, small=True
+                  ).pack()
+
+        self._sep(root)
+
+        # ── Progress & status ─────────────────────────────────────────────
         self.progress = ttk.Progressbar(root, mode="indeterminate")
-        self.progress.pack(fill="x", pady=(10, 0))
+        self.progress.pack(fill="x", pady=(10, 0), **pad)
         self.progress.pack_forget()
 
-        tk.Label(root, textvariable=self.status_msg, font=self.font_status,
-                 bg=self.BG, fg=self.FG2, anchor="w"
-                 ).pack(fill="x", pady=(8, 0))
+        self.det_progress = ttk.Progressbar(root, mode="determinate")
+        self.det_progress.pack(fill="x", pady=(4, 0), **pad)
+        self.det_progress.pack_forget()
 
+        tk.Label(root, textvariable=self.status_msg, font=self.font_status,
+                 bg=self.BG, fg=self.FG2, anchor="w", **pad
+                 ).pack(fill="x", pady=(8, 20))
+
+    # ── widget helpers ────────────────────────────────────────────────────────
     def _sep(self, p):
         tk.Frame(p, bg=self.BORDER, height=1).pack(fill="x", pady=8)
+
+    def _hsep(self, p):
+        tk.Frame(p, bg=self.BORDER, height=1).pack(fill="x", padx=14)
 
     def _btn(self, parent, text, cmd, small=False, accent=False):
         bg  = self.ACCENT if accent else self.ENTRY
@@ -277,6 +521,28 @@ class AudioSplitterApp(tk.Tk):
                          relief="flat", font=self.font_btn,
                          padx=6 if small else 10, pady=4,
                          cursor="hand2", bd=0)
+
+    def _on_format_change(self):
+        """Show/hide quality selector based on whether format is lossy."""
+        fmt = self.out_format.get()
+        lossless = fmt in ("wav", "flac")
+        # Hide quality radios for lossless, show note instead
+        for w in self.qual_col.winfo_children():
+            for child in w.winfo_children() if hasattr(w, 'winfo_children') else []:
+                pass
+        if lossless:
+            self.lbl_lossless.pack(side="left", padx=6)
+        else:
+            self.lbl_lossless.pack_forget()
+
+    def _get_quality_kbps(self) -> int | None:
+        """Return selected kbps as int, or None if format is lossless."""
+        if self.out_format.get() in ("wav", "flac"):
+            return None
+        try:
+            return int(self.quality_var.get())
+        except ValueError:
+            return 128
 
     # ── file open ─────────────────────────────────────────────────────────────
     def _open_file(self):
@@ -291,20 +557,22 @@ class AudioSplitterApp(tk.Tk):
 
         def do_probe():
             try:
-                info = get_audio_info(path)
-                self.after(0, lambda: self._probe_done(path, info))
+                info     = get_audio_info(path)
+                chapters = get_chapters(path)
+                self.after(0, lambda: self._probe_done(path, info, chapters))
             except Exception as ex:
                 err = str(ex)
                 self.after(0, lambda: self._probe_error(err))
 
         threading.Thread(target=do_probe, daemon=True).start()
 
-    def _probe_done(self, path, info):
+    def _probe_done(self, path, info, chapters):
         self.progress.stop()
         self.progress.pack_forget()
         self.duration_ms = info["duration_ms"]
         self.start_ms    = 0
         self.end_ms      = self.duration_ms
+        self.chapters    = chapters
         self.start_str.set(ms_to_hms(0))
         self.end_str.set(ms_to_hms(self.duration_ms))
         self.lbl_info.config(
@@ -313,6 +581,17 @@ class AudioSplitterApp(tk.Tk):
         )
         self._draw_timeline()
         self._update_seg_label()
+
+        # Chapter button
+        if chapters:
+            self.lbl_chapters.config(
+                text=f"{len(chapters)} chapter(s) found — will export to a folder"
+            )
+            self.btn_chapters.config(state="normal")
+        else:
+            self.lbl_chapters.config(text="No chapters found in this file.")
+            self.btn_chapters.config(state="disabled")
+
         self.status_msg.set(f"Ready: {Path(path).name}")
 
     def _probe_error(self, msg):
@@ -323,7 +602,7 @@ class AudioSplitterApp(tk.Tk):
 
     # ── timeline ──────────────────────────────────────────────────────────────
     def _draw_timeline(self, *_):
-        c = self.canvas
+        c = self.timeline
         c.delete("all")
         W = c.winfo_width()  or 640
         H = c.winfo_height() or 84
@@ -335,6 +614,11 @@ class AudioSplitterApp(tk.Tk):
             return
 
         c.create_rectangle(0, 0, W, H, fill=self.PANEL, outline="")
+
+        # Chapter markers
+        for ch in self.chapters:
+            x = self._ms2x(ch["start_ms"], W)
+            c.create_line(x, 0, x, H, fill="#444466", width=1, dash=(3, 3))
 
         for i in range(1, 10):
             x = int(W * i / 10)
@@ -367,7 +651,7 @@ class AudioSplitterApp(tk.Tk):
     def _canvas_press(self, e):
         if not self.duration_ms:
             return
-        W  = self.canvas.winfo_width()
+        W  = self.timeline.winfo_width()
         xs = self._ms2x(self.start_ms, W)
         xe = self._ms2x(self.end_ms,   W)
         self.dragging = "start" if abs(e.x - xs) <= abs(e.x - xe) else "end"
@@ -375,7 +659,7 @@ class AudioSplitterApp(tk.Tk):
     def _canvas_drag(self, e):
         if not self.dragging or not self.duration_ms:
             return
-        W  = self.canvas.winfo_width()
+        W  = self.timeline.winfo_width()
         ms = self._x2ms(e.x, W)
         if self.dragging == "start":
             self.start_ms = max(0, min(ms, self.end_ms - 500))
@@ -413,7 +697,7 @@ class AudioSplitterApp(tk.Tk):
                 text=f"Segment length: {ms_to_hms(self.end_ms - self.start_ms)}"
             )
 
-    # ── export ────────────────────────────────────────────────────────────────
+    # ── export single segment ─────────────────────────────────────────────────
     def _export(self):
         if not self.duration_ms:
             messagebox.showwarning("No file", "Please open an audio file first.")
@@ -422,11 +706,12 @@ class AudioSplitterApp(tk.Tk):
             messagebox.showwarning("Invalid range", "Start must be before End.")
             return
 
-        fmt  = self.out_format.get()
-        src  = self.src_path.get()
-        stem = Path(src).stem
-        s_tag = ms_to_hms(self.start_ms).replace(":", "-")
-        e_tag = ms_to_hms(self.end_ms).replace(":", "-")
+        fmt     = self.out_format.get()
+        quality = self._get_quality_kbps()
+        src     = self.src_path.get()
+        stem    = Path(src).stem
+        s_tag   = ms_to_hms(self.start_ms).replace(":", "-")
+        e_tag   = ms_to_hms(self.end_ms).replace(":", "-")
         default_name = f"{stem}_{s_tag}_{e_tag}.{fmt}"
 
         out_path = filedialog.asksaveasfilename(
@@ -446,7 +731,7 @@ class AudioSplitterApp(tk.Tk):
 
         def do_export():
             try:
-                export_segment(src, out_path, s_ms, e_ms, fmt)
+                export_segment(src, out_path, s_ms, e_ms, fmt, quality)
                 size_kb = os.path.getsize(out_path) / 1024
                 self.after(0, lambda: self._export_done(out_path, size_kb))
             except Exception as ex:
@@ -467,6 +752,201 @@ class AudioSplitterApp(tk.Tk):
         self.progress.pack_forget()
         self.status_msg.set("Export failed.")
         messagebox.showerror("Export error", msg)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # NEW — Batch split helpers
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _check_file_loaded(self) -> bool:
+        if not self.duration_ms:
+            messagebox.showwarning("No file", "Please open an audio file first.")
+            return False
+        return True
+
+    def _ask_output_folder(self) -> str | None:
+        folder = filedialog.askdirectory(title="Choose output folder")
+        return folder or None
+
+    def _run_batch(self, segments: list, folder: str, stem: str):
+        """
+        segments: list of (filename_no_ext, start_ms, end_ms)
+        Runs in a worker thread; updates determinate progress bar.
+        """
+        fmt     = self.out_format.get()
+        quality = self._get_quality_kbps()
+        src     = self.src_path.get()
+        total   = len(segments)
+
+        self.det_progress["maximum"] = total
+        self.det_progress["value"]   = 0
+        self.det_progress.pack(fill="x", pady=(4, 0), padx=28)
+        self.progress.pack(fill="x", pady=(10, 0), padx=28)
+        self.progress.start(12)
+        self.status_msg.set(f"Exporting {total} segment(s)…")
+        self.update()
+
+        errors = []
+
+        def do_batch():
+            for i, (name, s_ms, e_ms) in enumerate(segments, 1):
+                out = os.path.join(folder, f"{name}.{fmt}")
+                try:
+                    export_segment(src, out, s_ms, e_ms, fmt, quality)
+                except Exception as ex:
+                    errors.append(f"{name}: {ex}")
+                self.after(0, lambda v=i: self._batch_tick(v, total))
+
+            self.after(0, lambda: self._batch_done(total, errors, folder))
+
+        threading.Thread(target=do_batch, daemon=True).start()
+
+    def _batch_tick(self, done, total):
+        self.det_progress["value"] = done
+        self.status_msg.set(f"Exported {done} / {total}…")
+
+    def _batch_done(self, total, errors, folder):
+        self.progress.stop()
+        self.progress.pack_forget()
+        self.det_progress.pack_forget()
+        if errors:
+            messagebox.showwarning(
+                "Partial export",
+                f"{total - len(errors)} of {total} exported.\n\nErrors:\n" +
+                "\n".join(errors[:5])
+            )
+        else:
+            self.status_msg.set(f"✓ All {total} segments exported to {folder}")
+            messagebox.showinfo("Done",
+                                f"All {total} segment(s) exported!\n\n{folder}")
+
+    # ── ① Split by chapters ──────────────────────────────────────────────────
+    def _split_chapters(self):
+        if not self._check_file_loaded():
+            return
+        if not self.chapters:
+            messagebox.showinfo("No chapters", "This file has no embedded chapters.")
+            return
+
+        folder = self._ask_output_folder()
+        if not folder:
+            return
+
+        stem     = Path(self.src_path.get()).stem
+        segments = []
+        for i, ch in enumerate(self.chapters, 1):
+            safe_title = sanitize_filename(ch["title"])
+            name       = f"{i:02d} - {safe_title}"
+            segments.append((name, ch["start_ms"], ch["end_ms"]))
+
+        self._run_batch(segments, folder, stem)
+
+    # ── ② Split into equal-duration parts ────────────────────────────────────
+    def _calc_equal_parts(self):
+        """Return (part_ms, segments_list) or raise ValueError."""
+        try:
+            h = int(self.eq_hours.get() or 0)
+            m = int(self.eq_mins.get()  or 0)
+        except ValueError:
+            raise ValueError("Hours and minutes must be whole numbers.")
+        part_ms = (h * 3600 + m * 60) * 1000
+        if part_ms <= 0:
+            raise ValueError("Part length must be greater than 0.")
+        if not self.duration_ms:
+            raise ValueError("No file loaded.")
+
+        total    = self.duration_ms
+        segments = []
+        start    = 0
+        idx      = 1
+        stem     = Path(self.src_path.get()).stem
+        while start < total:
+            end  = min(start + part_ms, total)
+            name = f"{stem}_part{idx:03d}_{ms_to_hms(start).replace(':','-')}_{ms_to_hms(end).replace(':','-')}"
+            segments.append((name, start, end))
+            start += part_ms
+            idx   += 1
+        return part_ms, segments
+
+    def _preview_equal_parts(self):
+        if not self._check_file_loaded():
+            return
+        try:
+            part_ms, segs = self._calc_equal_parts()
+        except ValueError as ex:
+            self.lbl_eq_preview.config(text=str(ex), fg="#cc6666")
+            return
+        last_dur = (self.duration_ms % part_ms) or part_ms
+        self.lbl_eq_preview.config(
+            text=f"→ {len(segs)} file(s)  "
+                 f"(last part: {ms_to_hms(last_dur)})",
+            fg=self.FG2
+        )
+
+    def _split_equal_parts(self):
+        if not self._check_file_loaded():
+            return
+        try:
+            _, segs = self._calc_equal_parts()
+        except ValueError as ex:
+            messagebox.showwarning("Invalid input", str(ex))
+            return
+
+        folder = self._ask_output_folder()
+        if not folder:
+            return
+        stem = Path(self.src_path.get()).stem
+        self._run_batch(segs, folder, stem)
+
+    # ── ③ Split into N equal files ────────────────────────────────────────────
+    def _calc_n_parts(self):
+        """Return segments list or raise ValueError."""
+        try:
+            n = int(self.n_parts_var.get())
+        except ValueError:
+            raise ValueError("Number of parts must be a whole number.")
+        if n < 2:
+            raise ValueError("Number of parts must be at least 2.")
+        if not self.duration_ms:
+            raise ValueError("No file loaded.")
+
+        part_ms  = self.duration_ms // n
+        segments = []
+        stem     = Path(self.src_path.get()).stem
+        for i in range(n):
+            start = i * part_ms
+            end   = self.duration_ms if i == n - 1 else (i + 1) * part_ms
+            name  = f"{stem}_part{i+1:03d}_of{n:03d}"
+            segments.append((name, start, end))
+        return segments
+
+    def _preview_n_parts(self):
+        if not self._check_file_loaded():
+            return
+        try:
+            segs = self._calc_n_parts()
+        except ValueError as ex:
+            self.lbl_n_preview.config(text=str(ex), fg="#cc6666")
+            return
+        part_ms = self.duration_ms // len(segs)
+        self.lbl_n_preview.config(
+            text=f"→ {len(segs)} file(s),  each ~{ms_to_hms(part_ms)}",
+            fg=self.FG2
+        )
+
+    def _split_n_parts(self):
+        if not self._check_file_loaded():
+            return
+        try:
+            segs = self._calc_n_parts()
+        except ValueError as ex:
+            messagebox.showwarning("Invalid input", str(ex))
+            return
+
+        folder = self._ask_output_folder()
+        if not folder:
+            return
+        stem = Path(self.src_path.get()).stem
+        self._run_batch(segs, folder, stem)
 
 
 # ── entry ─────────────────────────────────────────────────────────────────────
